@@ -1,0 +1,137 @@
+# 《Survival Log 生存日志》存档金钱修改报告
+
+## 结论
+
+金钱已改成 **1000**。
+
+| 项 | 值 |
+|---|---|
+| 存档文件 | `C:\Users\feila\AppData\LocalLow\LLS\SLGame\Saves\Save_2026_10_03_20_04_11.bytes` |
+| 金钱字段 | `GameCore.HotUpdate.AgentSave.Money`（int32） |
+| 文件偏移 | **0x1160** |
+| 修改前 | 10 |
+| 修改后 | 1000 |
+| 实际改动字节 | 只有 2 个（0x1160、0x1161：`0A 00` → `E8 03`） |
+
+`.bak` 同步改了同样的值。
+
+---
+
+## 一、存档格式：MemoryPack（这是关键突破）
+
+存档不是 JSON / Unity YAML / BinaryFormatter，而是 **Cysharp 的 MemoryPack** 序列化格式。
+证据：反编译出的所有存档类都带 `[MemoryPackable(GenerateType.Object)]`，例如
+
+```csharp
+[MemoryPackable(GenerateType::Object (0))]
+public class GameSaveData : IConfig, IMemoryPackable<GameSaveData> { ... }
+```
+
+MemoryPack 的线格式（已对照官方源码 `MemoryPackWriter.cs` / `MemoryPackCode.cs` 确认）：
+
+| 内容 | 编码 |
+|---|---|
+| 对象 | 1 字节成员数（0–249；255 = null） |
+| 集合 / 数组 / 列表长度 | int32（-1 = null） |
+| 字符串 | `int32 ~utf8字节数`（即 -(字节数+1)）+ `int32 UTF16字符数` + UTF8 数据；`0` = 空串，`-1` = null |
+| bool / int / long / float | 1 / 4 / 8 / 4 字节 |
+
+这条规则解释了之前逆向文档里那个奇怪的 `-(byteLen+1), charLen` 编码——它就是 MemoryPack 的字符串头。
+GameSaveData 全 74 个成员按**声明顺序**依次写入，文件第一个字节 `0x4A` = 74 就是成员数。
+
+---
+
+## 二、金钱在哪里
+
+成员顺序（来自 il2cpp 元数据）给出路径：
+
+```
+GameSaveData (74 个成员)
+  └─ [19] CurSave : SaveChildData (194 个成员)
+        └─ [0] LeadingRole : AgentSave (148 个成员)
+              ├─ [38] Name  : string     ← “玩家-打工仔”
+              └─ [39] Money : int        ← 目标
+```
+
+## 三、定位过程中的三重独立验证
+
+1. **对象边界**：`History`（`List<SaveChildData>`）里有 1 个元素，它作为完整的 194 成员对象，
+   解析结束位置恰好落在 0xC78——而 0xC78 的字节正是 `0xC2`(=194)，0xC79 是 `0x94`(=148)，
+   即 `CurSave` 和 `LeadingRole` 的成员数。说明从文件头到 `CurSave` 起点全部对齐正确。
+2. **字符串锚点（Money 之前）**：0x1148 处是规范字符串头 `~16字节 / 6字符`，
+   内容是 `玩家-打工仔`，正好在 0x1160 结束 → 紧随其后的 int32 就是 `Money`（当时 = 10）。
+3. **字符串锚点（Money 之后）**：成员 59 `BuildPackagePointMap` 里的 `HomePackage02`
+   精确出现在预测的 0x11D8，说明 0x1160 之后到成员 59 之间也没有错位。
+
+另外独立佐证：`CurSave.PurchaseSafetyState` 位于 0x3208D，
+内容是 `05 01 01 01 2C 06 00 00` = 5 个成员、3 个 true、`DisasterInitialMoney = 1580`，
+与 `Player.log` 里的 baseline `gold=550/1580`、`260/1580` 完全吻合。
+
+---
+
+## 四、进游戏怎么验证
+
+1. 完全退出游戏（改之前游戏必须是关闭状态——脚本会强制检查）。
+2. 启动游戏，读取 `Save_2026_10_03_20_04_11` 存档。
+3. 看金钱：应显示 **1000**（改之前是 10，可以先用这个对照确认定位没错）。
+
+### 如果进游戏后发现没变
+
+通常是 **Steam 云同步**把旧存档盖回来了：
+
+- 右键《Survival Log》→ 属性 → 通用 → 取消勾选 **Steam 云**（或整个 Steam 用离线模式），再进游戏；
+- 确认生效后再决定要不要重新打开云同步（重开云同步时注意选择“本地文件覆盖云端”）。
+
+---
+
+## 五、备份与恢复
+
+| 用途 | 路径 |
+|---|---|
+| 原始存档（金钱 = 10） | `outputs\Save_original_money10.bytes` |
+| 游戏目录内的自动备份 | `...\LocalLow\LLS\SLGame\Saves\backup_20261003_212414\` |
+| 一键改金钱 | `outputs\patch_money.ps1`（默认改 1000，可加 `-Money 5000`） |
+| 一键恢复 | `outputs\restore_save.ps1` |
+
+用法示例：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File patch_money.ps1 -Show         # 只看当前金钱
+powershell -ExecutionPolicy Bypass -File patch_money.ps1 -Money 1000   # 改成 1000
+powershell -ExecutionPolicy Bypass -File restore_save.ps1              # 恢复原始存档
+```
+
+脚本内置护栏：写入前会检查 `Money` 前面的角色名字符串头（`~16字节 / 6字符`）和文件首字节（74）。
+不匹配就直接放弃写入，避免把存档写坏。
+
+---
+
+## 六、注意事项
+
+- **偏移 0x1160 只对当前这个存档有效。** MemoryPack 是变长序列化，
+  一旦你在游戏里重新存过档（NPC、物品、建筑等数量变化），金钱偏移会移动。
+  那时需要重新定位（脚本的 `-Show` 会显示异常值，护栏也会拦住）。
+- 存档里**没有校验和 / 哈希字段**（GameSaveData、SaveChildData、AgentSave 的全部成员名都已核对），
+  所以不用担心改完被判定为损坏。
+- 游戏内 `PurchaseSafetyState.DisasterInitialMoney = 1580` 是“历史最高金钱”基线。
+  1000 < 1580，不会触发异常提示逻辑。
+
+---
+
+## 七、工具链（复现方式）
+
+| 工具 | 用途 |
+|---|---|
+| Il2CppDumper v6.7.46 | 早期尝试；Unity 6 自动模式失败 |
+| **Cpp2IL 2022.1.0-pre-release.21** | 成功解析 Unity 6000.2.7f2（元数据 v31.1），导出全部类结构 |
+| `work\meta_parse.py` / `meta_tree.py` | 自己写的 `global-metadata.dat` 解析器（修正了 v31 结构偏移） |
+| `work\mpsave.py` | MemoryPack 读取器：按类结构走位，定位任意字段的文件偏移 |
+
+---
+
+## 八、遗留问题（不影响本次修改）
+
+解析 `AgentSave` 成员 60 之后某处会出现轻微错位（表现为 `CurSave.Day` 走偏等），
+推测是某个成员类型用了本解析器还没覆盖的 MemoryPack 写法（自定义 formatter 之类）。
+由于 `Money` 在成员 39，且其前后都有字符串锚点硬验证，该问题不影响本次修改结果。
+如果以后需要改其它字段（物品、建筑等），可以先把这块补全。
